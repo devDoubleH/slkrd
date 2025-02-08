@@ -1,13 +1,23 @@
 use std::env;
 use std::fs::File;
-use std::io::{self, Read, Write, Seek, ErrorKind};
-use std::net::{TcpListener, TcpStream, UdpSocket, SocketAddr};
+use std::io::{self, Read, Write, ErrorKind};
+use std::net::{UdpSocket, TcpListener, TcpStream};
 use std::path::Path;
 use std::process;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use rand::Rng;
+use webrtc::api::APIBuilder;
+use webrtc::data_channel::data_channel_message::DataChannelMessage;
+use webrtc::data_channel::RTCDataChannel;
+use webrtc::ice_transport::ice_server::RTCIceServer;
+use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::RTCPeerConnection;
+use tokio::runtime::Runtime;
+use bytes::Bytes;
 
-const BUFFER_SIZE: usize = 1024 * 1024; // Reduced to 1MB
+const MAX_RETRIES: u32 = 3;
+const BUFFER_SIZE: usize = 1024 * 1024;
 const DISCOVERY_PORT: u16 = 45678;
 const TRANSFER_PORT: u16 = 45679;
 const PASSCODE_LENGTH: usize = 6;
@@ -80,7 +90,7 @@ fn print_usage() {
 }
 
 fn generate_passcode() -> String {
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const CHARSET: &[u8] = b"0123456789";
     let mut rng = rand::thread_rng();
     (0..PASSCODE_LENGTH)
         .map(|_| {
@@ -91,12 +101,98 @@ fn generate_passcode() -> String {
 }
 
 fn validate_passcode(passcode: &str) -> Result<(), SlkrdError> {
-    if passcode.len() != PASSCODE_LENGTH || !passcode.chars().all(|c| c.is_ascii_alphanumeric()) {
+    if passcode.len() != PASSCODE_LENGTH || !passcode.chars().all(|c| c.is_ascii_digit()) {
         Err(SlkrdError::InvalidPasscode)
     } else {
         Ok(())
     }
 }
+
+struct WebRTCChannel {
+    peer_connection: Arc<RTCPeerConnection>,
+    data_channel: Arc<RTCDataChannel>,
+    received_data: Arc<Mutex<Vec<u8>>>,
+    runtime: Runtime,
+}
+
+impl WebRTCChannel {
+    fn new() -> Result<Self, SlkrdError> {
+        let runtime = Runtime::new().map_err(|_| SlkrdError::ConnectionFailed)?;
+        let config = RTCConfiguration {
+            ice_servers: vec![RTCIceServer {
+                urls: vec!["stun:stun.l.google.com:19302".to_owned()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let api = APIBuilder::new().build();
+        let peer_connection = Arc::new(
+            runtime.block_on(api.new_peer_connection(config))
+                .map_err(|_| SlkrdError::ConnectionFailed)?
+        );
+
+        // Create offer
+        let offer = runtime.block_on(peer_connection.create_offer(None))
+            .map_err(|_| SlkrdError::ConnectionFailed)?;
+
+        // Set local description
+        runtime.block_on(peer_connection.set_local_description(offer.clone()))
+            .map_err(|_| SlkrdError::ConnectionFailed)?;
+
+        let data_channel = runtime.block_on(peer_connection.create_data_channel(
+            "data",
+            None,
+        ))
+        .map_err(|_| SlkrdError::ConnectionFailed)?;
+
+        let received_data = Arc::new(Mutex::new(Vec::new()));
+        let received_data_clone = received_data.clone();
+
+        let dc = Arc::new(data_channel.clone());
+        runtime.block_on(async {
+            dc.on_message(Box::new(move |msg: DataChannelMessage| {
+                let mut data = received_data_clone.lock().unwrap();
+                data.extend_from_slice(&msg.data);
+                Box::pin(async {})
+            }));
+        });
+
+        // Handle ICE candidate gathering
+        let pc = peer_connection.clone();
+        runtime.block_on(async {
+            pc.on_ice_candidate(Box::new(move |candidate_opt| {
+                if let Some(candidate) = candidate_opt {
+                    println!("New ICE candidate: {}", candidate.to_string());
+                }
+                Box::pin(async {})
+            }));
+        });
+
+        Ok(WebRTCChannel {
+            peer_connection,
+            data_channel,
+            received_data,
+            runtime,
+        })
+    }
+
+    fn send(&self, data: &[u8]) -> Result<(), SlkrdError> {
+        self.runtime
+            .block_on(self.data_channel.send(&Bytes::from(data.to_vec())))
+            .map(|_| ())
+            .map_err(|_| SlkrdError::TransferError)
+    }
+
+    fn receive(&self) -> Result<Vec<u8>, SlkrdError> {
+        let mut data = self.received_data.lock().unwrap();
+        let result = data.clone();
+        data.clear();
+        Ok(result)
+    }
+}
+
+use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
 fn send_file(file_path: &str) -> Result<(), SlkrdError> {
     let path = Path::new(file_path);
@@ -120,139 +216,7 @@ fn send_file(file_path: &str) -> Result<(), SlkrdError> {
     let file_size = file.metadata()?.len();
     let filename = path.file_name().unwrap().to_string_lossy().to_string();
 
-    broadcast_and_transfer(&discovery_socket, &listener, &passcode, &filename, &mut file, file_size)
-}
-
-// Update buffer size to 1MB for better performance with large files
-
-
-fn receive_and_save_file(stream: &mut TcpStream, filename: &str) -> Result<(), SlkrdError> {
-    if Path::new(filename).exists() {
-        return Err(SlkrdError::FileExists);
-    }
-
-    // Set single timeout of 10 minutes
-    stream.set_read_timeout(Some(Duration::from_secs(600)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(600)))?;
-
-    let mut size_bytes = [0u8; 8];
-    stream.read_exact(&mut size_bytes)?;
-    let file_size = u64::from_le_bytes(size_bytes);
-
-    // Use BufWriter for buffered writes
-    let file = File::create(filename)?;
-    let mut file = io::BufWriter::new(file);
-    let mut buffer = vec![0; BUFFER_SIZE];
-    let mut received = 0;
-    let start_time = std::time::Instant::now();
-    let mut last_update = start_time;
-
-    println!("Receiving file: {} ({})", filename, format_size(file_size));
-
-    // Use BufReader for buffered reads
-    let mut stream = io::BufReader::new(stream);
-
-    while received < file_size {
-        let n = stream.read(&mut buffer)?;
-        if n == 0 { break; }
-        file.write_all(&buffer[..n])?;
-        received += n as u64;
-
-        let now = std::time::Instant::now();
-        // Update progress less frequently (every 500ms instead of 100ms)
-        if now.duration_since(last_update).as_millis() >= 500 {
-            let elapsed = now.duration_since(start_time).as_secs_f64();
-            let speed = received as f64 / elapsed;
-            let remaining = (file_size - received) as f64 / speed;
-            
-            print!("\rProgress: {:.1}% ({} / {}) - {}/s - ETA: {:.0}s",
-                (received as f64 / file_size as f64) * 100.0,
-                format_size(received),
-                format_size(file_size),
-                format_size(speed as u64),
-                remaining.ceil()
-            );
-            io::stdout().flush()?;
-            last_update = now;
-        }
-    }
-
-    // Ensure all buffered data is written
-    file.flush()?;
-
-    if received != file_size {
-        return Err(SlkrdError::IncompleteTransfer(received, file_size));
-    }
-
-    println!("\nTransfer complete! Total time: {:.1}s", start_time.elapsed().as_secs_f64());
-    Ok(())
-}
-
-fn transfer_file(stream: &mut TcpStream, file: &mut File, file_size: u64) -> Result<(), SlkrdError> {
-    stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(Duration::from_secs(600)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(600)))?;
-
-    // Use buffered I/O for better performance
-    let mut file = io::BufReader::new(file);
-    let mut stream = io::BufWriter::new(stream);
-    let mut buffer = vec![0; BUFFER_SIZE];
-    let mut transferred = 0;
-    let start_time = std::time::Instant::now();
-    let mut last_update = start_time;
-    
-    println!("Starting transfer of {}", format_size(file_size));
-    
-    while transferred < file_size {
-        let n = file.read(&mut buffer)?;
-        if n == 0 { break; }
-        stream.write_all(&buffer[..n])?;
-        transferred += n as u64;
-        
-        let now = std::time::Instant::now();
-        // Update progress less frequently
-        if now.duration_since(last_update).as_millis() >= 500 {
-            let elapsed = now.duration_since(start_time).as_secs_f64();
-            let speed = transferred as f64 / elapsed;
-            let remaining = (file_size - transferred) as f64 / speed;
-            
-            print!("\rProgress: {:.1}% ({} / {}) - {}/s - ETA: {:.0}s",
-                (transferred as f64 / file_size as f64) * 100.0,
-                format_size(transferred),
-                format_size(file_size),
-                format_size(speed as u64),
-                remaining.ceil()
-            );
-            io::stdout().flush()?;
-            last_update = now;
-        }
-    }
-
-    // Ensure all buffered data is written
-    stream.flush()?;
-
-    if transferred != file_size {
-        return Err(SlkrdError::IncompleteTransfer(transferred, file_size));
-    }
-
-    println!("\nTransfer complete! Total time: {:.1}s", start_time.elapsed().as_secs_f64());
-    Ok(())
-}
-
-// Add new constant at the top with other constants
-const MAX_RETRIES: u32 = 3;
-
-// In broadcast_and_transfer function
-fn broadcast_and_transfer(
-    discovery_socket: &UdpSocket,
-    listener: &TcpListener,
-    passcode: &str,
-    filename: &str,
-    file: &mut File,
-    file_size: u64
-) -> Result<(), SlkrdError> {
     let mut retries = 0;
-    
     while retries < MAX_RETRIES {
         let message = format!("SLKRD:{}:{}", passcode, filename);
         discovery_socket.send_to(message.as_bytes(), ("255.255.255.255", DISCOVERY_PORT))?;
@@ -260,40 +224,55 @@ fn broadcast_and_transfer(
         match listener.accept() {
             Ok((mut stream, _)) => {
                 println!("Receiver connected. Starting transfer...");
-                match transfer_file(&mut stream, file, file_size) {
-                    Ok(()) => return Ok(()),
-                    Err(SlkrdError::Timeout) => {
-                        eprintln!("Transfer timed out, retrying... ({}/{})", retries + 1, MAX_RETRIES);
-                        retries += 1;
-                        // Seek back to start of file for retry
-                        file.seek(std::io::SeekFrom::Start(0))?;
-                        continue;
-                    }
-                    Err(e) => return Err(e),
+                let channel = WebRTCChannel::new()?;
+                
+                // Send file size first
+                stream.write_all(&file_size.to_le_bytes())?;
+                
+                // Exchange WebRTC signaling
+                let offer = channel.runtime.block_on(channel.peer_connection.create_offer(None))
+                    .map_err(|_| SlkrdError::ConnectionFailed)?;
+                let offer_sdp = serde_json::to_string(&offer)
+                    .map_err(|_| SlkrdError::ConnectionFailed)?;
+                stream.write_all(offer_sdp.as_bytes())?;
+
+                // Receive answer
+                let mut answer_buf = Vec::new();
+                stream.read_to_end(&mut answer_buf)?;
+                let answer: RTCSessionDescription = serde_json::from_slice(&answer_buf)
+                    .map_err(|_| SlkrdError::ConnectionFailed)?;
+                channel.runtime.block_on(channel.peer_connection.set_remote_description(answer))
+                    .map_err(|_| SlkrdError::ConnectionFailed)?;
+
+                let mut buffer = vec![0; BUFFER_SIZE];
+                let mut transferred = 0;
+                
+                while transferred < file_size {
+                    let n = file.read(&mut buffer)?;
+                    if n == 0 { break; }
+                    channel.send(&buffer[..n])?;
+                    transferred += n as u64;
+                    print_progress(transferred, file_size);
+                }
+                
+                if transferred == file_size {
+                    println!("\nTransfer complete!");
+                    return Ok(());
                 }
             }
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(100));
                 continue;
             }
-            Err(_) => return Err(SlkrdError::ConnectionFailed),
+            Err(_) => {
+                retries += 1;
+                println!("Connection attempt failed. Retrying... ({}/{})", retries, MAX_RETRIES);
+                continue;
+            }
         }
     }
     
-    Err(SlkrdError::Timeout)
-}
-
-fn format_size(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-    let mut size = bytes as f64;
-    let mut unit_index = 0;
-
-    while size >= 1024.0 && unit_index < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit_index += 1;
-    }
-
-    format!("{:.2} {}", size, UNITS[unit_index])
+    Err(SlkrdError::ConnectionFailed)
 }
 
 fn receive_file(passcode: &str) -> Result<(), SlkrdError> {
@@ -302,32 +281,104 @@ fn receive_file(passcode: &str) -> Result<(), SlkrdError> {
     let socket = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT))?;
     println!("Searching for sender...");
 
-    let (sender_addr, filename) = find_sender(&socket, passcode)?;
-    
-    let mut stream = TcpStream::connect((sender_addr.ip(), TRANSFER_PORT))?;
-    receive_and_save_file(&mut stream, &filename)
-}
-
-fn find_sender(socket: &UdpSocket, target_passcode: &str) -> Result<(SocketAddr, String), SlkrdError> {
-    let mut buf = [0; 1024];
-
-    loop {
-        match socket.recv_from(&mut buf) {
-            Ok((size, addr)) => {
-                let message = String::from_utf8_lossy(&buf[..size]);
-                if let Some(data) = message.strip_prefix("SLKRD:") {
-                    let parts: Vec<&str> = data.split(':').collect();
-                    if parts.len() == 2 && parts[0] == target_passcode {
-                        println!("Found sender. Connecting...");
-                        return Ok((addr, parts[1].to_string()));
+    let (sender_addr, filename) = {
+        let mut buf = [0u8; 1024];
+        let mut sender_found = None;
+        
+        while sender_found.is_none() {
+            match socket.recv_from(&mut buf) {
+                Ok((size, addr)) => {
+                    let message = String::from_utf8_lossy(&buf[..size]);
+                    if let Some(content) = message.strip_prefix("SLKRD:") {
+                        let parts: Vec<&str> = content.split(':').collect();
+                        if parts.len() == 2 && parts[0] == passcode {
+                            sender_found = Some((addr, parts[1].to_string()));
+                            break;
+                        }
                     }
                 }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                Err(_) => return Err(SlkrdError::ConnectionFailed),
             }
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
-            }
-            Err(_) => return Err(SlkrdError::ConnectionFailed),
         }
+        
+        sender_found.ok_or(SlkrdError::ConnectionFailed)?
+    };
+    
+    if Path::new(&filename).exists() {
+        return Err(SlkrdError::FileExists);
+    }
+
+    let mut stream = TcpStream::connect((sender_addr.ip(), TRANSFER_PORT))?;
+    let channel = WebRTCChannel::new()?;
+    
+    // Read file size first
+    let mut size_bytes = [0u8; 8];
+    stream.read_exact(&mut size_bytes)?;
+    let file_size = u64::from_le_bytes(size_bytes);
+
+    // Receive offer
+    let mut offer_buf = Vec::new();
+    stream.read_to_end(&mut offer_buf)?;
+    let offer: RTCSessionDescription = serde_json::from_slice(&offer_buf)
+        .map_err(|_| SlkrdError::ConnectionFailed)?;
+    channel.runtime.block_on(channel.peer_connection.set_remote_description(offer))
+        .map_err(|_| SlkrdError::ConnectionFailed)?;
+
+    // Create and send answer
+    let answer = channel.runtime.block_on(channel.peer_connection.create_answer(None))
+        .map_err(|_| SlkrdError::ConnectionFailed)?;
+    channel.runtime.block_on(channel.peer_connection.set_local_description(answer.clone()))
+        .map_err(|_| SlkrdError::ConnectionFailed)?;
+    let answer_sdp = serde_json::to_string(&answer)
+        .map_err(|_| SlkrdError::ConnectionFailed)?;
+    stream.write_all(answer_sdp.as_bytes())?;
+
+    let mut file = File::create(&filename)?;
+    let mut received = 0;
+
+    while received < file_size {
+        let data = channel.receive()?;
+        if data.is_empty() { break; }
+        
+        file.write_all(&data)?;
+        received += data.len() as u64;
+        print_progress(received, file_size);
+    }
+
+    if received != file_size {
+        return Err(SlkrdError::IncompleteTransfer(received, file_size));
+    }
+
+    println!("\nTransfer complete!");
+    Ok(())
+}
+
+fn print_progress(current: u64, total: u64) {
+    print!("\rProgress: {:.1}% ({} / {})", 
+        (current as f64 / total as f64) * 100.0,
+        format_size(current),
+        format_size(total)
+    );
+    io::stdout().flush().unwrap();
+}
+
+fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
+    let mut size = bytes as f64;
+    let mut unit_index = 0;
+
+    while size >= 1024.0 && unit_index < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit_index += 1;
+    }
+
+    if unit_index == 0 {
+        format!("{} {}", size, UNITS[unit_index])
+    } else {
+        format!("{:.2} {}", size, UNITS[unit_index])
     }
 }

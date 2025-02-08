@@ -7,13 +7,10 @@ use std::process;
 use std::time::Duration;
 use rand::Rng;
 
-
-
-const BUFFER_SIZE: usize = 1024 * 1024; // 1MB buffer
+const BUFFER_SIZE: usize = 1024 * 1024; // Reduced to 1MB
 const DISCOVERY_PORT: u16 = 45678;
 const TRANSFER_PORT: u16 = 45679;
 const PASSCODE_LENGTH: usize = 6;
-const SFTP_DEFAULT_PORT: u16 = 22;
 
 #[derive(Debug)]
 enum SlkrdError {
@@ -196,9 +193,6 @@ fn transfer_file(stream: &mut TcpStream, file: &mut File, file_size: u64) -> Res
     stream.set_read_timeout(Some(Duration::from_secs(600)))?;
     stream.set_write_timeout(Some(Duration::from_secs(600)))?;
 
-    // Send file size first
-    stream.write_all(&file_size.to_le_bytes())?;
-    
     // Use buffered I/O for better performance
     let mut file = io::BufReader::new(file);
     let mut stream = io::BufWriter::new(stream);
@@ -336,131 +330,4 @@ fn find_sender(socket: &UdpSocket, target_passcode: &str) -> Result<(SocketAddr,
             Err(_) => return Err(SlkrdError::ConnectionFailed),
         }
     }
-}
-
-// Replace async transfer_file_sftp with sync version
-fn transfer_file_sftp(stream: &mut TcpStream, file: &mut File, file_size: u64, filename: &str) -> Result<(), SlkrdError> {
-    let mut session = ssh2::Session::new().map_err(|_| SlkrdError::ConnectionFailed)?;
-    session.set_tcp_stream(stream.try_clone().unwrap());
-    session.handshake().map_err(|_| SlkrdError::ConnectionFailed)?;
-
-    let username = env::var("SFTP_USER").unwrap_or_else(|_| "anonymous".to_string());
-    let password = env::var("SFTP_PASS").unwrap_or_default();
-
-    session
-        .userauth_password(&username, &password)
-        .map_err(|_| SlkrdError::ConnectionFailed)?;
-
-    let sftp = session.sftp().map_err(|_| SlkrdError::TransferError)?;
-    let remote_path = format!("/tmp/{}", filename);
-    let mut remote_file = sftp
-        .open(Path::new(&remote_path))
-        .map_err(|_| SlkrdError::TransferError)?;
-
-    let mut buffer = vec![0; BUFFER_SIZE];
-    let mut transferred = 0;
-    let start_time = std::time::Instant::now();
-    let mut last_update = start_time;
-
-    println!("Starting SFTP transfer of {}", format_size(file_size));
-
-    while transferred < file_size {
-        let n = file.read(&mut buffer)?;
-        if n == 0 { break; }
-        // No need to unwrap remote_file since it's already a ssh2::File
-        remote_file.write_all(&buffer[..n]).map_err(|_| SlkrdError::TransferError)?;
-        transferred += n as u64;
-
-        let now = std::time::Instant::now();
-        if now.duration_since(last_update).as_millis() >= 500 {
-            let elapsed = now.duration_since(start_time).as_secs_f64();
-            let speed = transferred as f64 / elapsed;
-            let remaining = (file_size - transferred) as f64 / speed;
-
-            print!("\rProgress: {:.1}% ({} / {}) - {}/s - ETA: {:.0}s",
-                (transferred as f64 / file_size as f64) * 100.0,
-                format_size(transferred),
-                format_size(file_size),
-                format_size(speed as u64),
-                remaining.ceil()
-            );
-            io::stdout().flush()?;
-            last_update = now;
-        }
-    }
-
-    if transferred != file_size {
-        return Err(SlkrdError::IncompleteTransfer(transferred, file_size));
-    }
-
-    println!("\nTransfer complete! Total time: {:.1}s", start_time.elapsed().as_secs_f64());
-    Ok(())
-}
-
-// Replace async receive_file_sftp with sync version
-fn receive_file_sftp(stream: &mut TcpStream, filename: &str) -> Result<(), SlkrdError> {
-    if Path::new(filename).exists() {
-        return Err(SlkrdError::FileExists);
-    }
-
-    let mut session = ssh2::Session::new().map_err(|_| SlkrdError::ConnectionFailed)?;
-    session.set_tcp_stream(stream.try_clone().unwrap());
-    session.handshake().map_err(|_| SlkrdError::ConnectionFailed)?;
-
-    let username = env::var("SFTP_USER").unwrap_or_else(|_| "anonymous".to_string());
-    let password = env::var("SFTP_PASS").unwrap_or_default();
-
-    session
-        .userauth_password(&username, &password)
-        .map_err(|_| SlkrdError::ConnectionFailed)?;
-
-    let sftp = session.sftp().map_err(|_| SlkrdError::TransferError)?;
-    let remote_path = format!("/tmp/{}", filename);
-    let mut remote_file = sftp
-        .open(Path::new(&remote_path))
-        .map_err(|_| SlkrdError::TransferError)?;
-
-    let file_size = remote_file.stat().map_err(|_| SlkrdError::TransferError)?.size.unwrap_or(0);
-    let file = File::create(filename)?;
-    let mut file = io::BufWriter::new(file);
-    let mut remote_file = io::BufReader::new(remote_file);
-    let mut buffer = vec![0; BUFFER_SIZE];
-    let mut received = 0;
-    let start_time = std::time::Instant::now();
-    let mut last_update = start_time;
-
-    println!("Receiving file via SFTP: {} ({})", filename, format_size(file_size));
-
-    while received < file_size {
-        let n = remote_file.read(&mut buffer)?;
-        if n == 0 { break; }
-        file.write_all(&buffer[..n])?;
-        received += n as u64;
-
-        let now = std::time::Instant::now();
-        if now.duration_since(last_update).as_millis() >= 500 {
-            let elapsed = now.duration_since(start_time).as_secs_f64();
-            let speed = received as f64 / elapsed;
-            let remaining = (file_size - received) as f64 / speed;
-
-            print!("\rProgress: {:.1}% ({} / {}) - {}/s - ETA: {:.0}s",
-                (received as f64 / file_size as f64) * 100.0,
-                format_size(received),
-                format_size(file_size),
-                format_size(speed as u64),
-                remaining.ceil()
-            );
-            io::stdout().flush()?;
-            last_update = now;
-        }
-    }
-
-    file.flush()?;
-
-    if received != file_size {
-        return Err(SlkrdError::IncompleteTransfer(received, file_size));
-    }
-
-    println!("\nTransfer complete! Total time: {:.1}s", start_time.elapsed().as_secs_f64());
-    Ok(())
 }

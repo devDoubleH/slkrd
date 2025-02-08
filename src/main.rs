@@ -132,6 +132,14 @@ impl WebRTCChannel {
                 .map_err(|_| SlkrdError::ConnectionFailed)?
         );
 
+        // Create offer
+        let offer = runtime.block_on(peer_connection.create_offer(None))
+            .map_err(|_| SlkrdError::ConnectionFailed)?;
+
+        // Set local description
+        runtime.block_on(peer_connection.set_local_description(offer.clone()))
+            .map_err(|_| SlkrdError::ConnectionFailed)?;
+
         let data_channel = runtime.block_on(peer_connection.create_data_channel(
             "data",
             None,
@@ -146,6 +154,17 @@ impl WebRTCChannel {
             dc.on_message(Box::new(move |msg: DataChannelMessage| {
                 let mut data = received_data_clone.lock().unwrap();
                 data.extend_from_slice(&msg.data);
+                Box::pin(async {})
+            }));
+        });
+
+        // Handle ICE candidate gathering
+        let pc = peer_connection.clone();
+        runtime.block_on(async {
+            pc.on_ice_candidate(Box::new(move |candidate_opt| {
+                if let Some(candidate) = candidate_opt {
+                    println!("New ICE candidate: {}", candidate.to_string());
+                }
                 Box::pin(async {})
             }));
         });
@@ -172,6 +191,8 @@ impl WebRTCChannel {
         Ok(result)
     }
 }
+
+use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
 fn send_file(file_path: &str) -> Result<(), SlkrdError> {
     let path = Path::new(file_path);
@@ -208,6 +229,21 @@ fn send_file(file_path: &str) -> Result<(), SlkrdError> {
                 // Send file size first
                 stream.write_all(&file_size.to_le_bytes())?;
                 
+                // Exchange WebRTC signaling
+                let offer = channel.runtime.block_on(channel.peer_connection.create_offer(None))
+                    .map_err(|_| SlkrdError::ConnectionFailed)?;
+                let offer_sdp = serde_json::to_string(&offer)
+                    .map_err(|_| SlkrdError::ConnectionFailed)?;
+                stream.write_all(offer_sdp.as_bytes())?;
+
+                // Receive answer
+                let mut answer_buf = Vec::new();
+                stream.read_to_end(&mut answer_buf)?;
+                let answer: RTCSessionDescription = serde_json::from_slice(&answer_buf)
+                    .map_err(|_| SlkrdError::ConnectionFailed)?;
+                channel.runtime.block_on(channel.peer_connection.set_remote_description(answer))
+                    .map_err(|_| SlkrdError::ConnectionFailed)?;
+
                 let mut buffer = vec![0; BUFFER_SIZE];
                 let mut transferred = 0;
                 
@@ -283,6 +319,23 @@ fn receive_file(passcode: &str) -> Result<(), SlkrdError> {
     let mut size_bytes = [0u8; 8];
     stream.read_exact(&mut size_bytes)?;
     let file_size = u64::from_le_bytes(size_bytes);
+
+    // Receive offer
+    let mut offer_buf = Vec::new();
+    stream.read_to_end(&mut offer_buf)?;
+    let offer: RTCSessionDescription = serde_json::from_slice(&offer_buf)
+        .map_err(|_| SlkrdError::ConnectionFailed)?;
+    channel.runtime.block_on(channel.peer_connection.set_remote_description(offer))
+        .map_err(|_| SlkrdError::ConnectionFailed)?;
+
+    // Create and send answer
+    let answer = channel.runtime.block_on(channel.peer_connection.create_answer(None))
+        .map_err(|_| SlkrdError::ConnectionFailed)?;
+    channel.runtime.block_on(channel.peer_connection.set_local_description(answer.clone()))
+        .map_err(|_| SlkrdError::ConnectionFailed)?;
+    let answer_sdp = serde_json::to_string(&answer)
+        .map_err(|_| SlkrdError::ConnectionFailed)?;
+    stream.write_all(answer_sdp.as_bytes())?;
 
     let mut file = File::create(&filename)?;
     let mut received = 0;

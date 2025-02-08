@@ -1553,6 +1553,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "rand 0.9.0",
+ "serde_json",
  "ssh2",
  "tokio",
  "webrtc",

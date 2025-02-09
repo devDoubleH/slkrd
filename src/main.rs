@@ -80,7 +80,7 @@ fn print_usage() {
 }
 
 fn generate_passcode() -> String {
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const CHARSET: &[u8] = b"0123456789";
     let mut rng = rand::thread_rng();
     (0..PASSCODE_LENGTH)
         .map(|_| {

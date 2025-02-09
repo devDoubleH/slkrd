@@ -2,16 +2,19 @@ use std::env;
 use std::fs::File;
 use std::io::{self, Read, Write, Seek, ErrorKind};
 use std::net::{TcpListener, TcpStream, UdpSocket, SocketAddr};
-use std::net::{Ipv4Addr, SocketAddrV4};  // Add this import
+use std::net::{SocketAddrV4};
 use std::path::Path;
 use std::process;
 use std::time::Duration;
 use rand::Rng;
+use socket2::{Socket, Domain, Type, Protocol};
 
-const BUFFER_SIZE: usize = 64 * 1024; // Reduced to 64KB
+const BUFFER_SIZE: usize = 64 * 1024; // 64KB
 const DISCOVERY_PORT: u16 = 45678;
 const TRANSFER_PORT: u16 = 45679;
 const PASSCODE_LENGTH: usize = 6;
+const MAX_RETRIES: u32 = 3;
+const TCP_KEEPALIVE_DURATION: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 enum SlkrdError {
@@ -129,15 +132,13 @@ fn receive_and_save_file(stream: &mut TcpStream, filename: &str) -> Result<(), S
         return Err(SlkrdError::FileExists);
     }
 
-    // Increase timeout to 10 minutes
+    // Set TCP keepalive
+    let socket = Socket::from(stream.try_clone()?);
+    socket.set_keepalive(true)?;
+    socket.set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(TCP_KEEPALIVE_DURATION))?;
+
     stream.set_read_timeout(Some(Duration::from_secs(600)))?;
     stream.set_write_timeout(Some(Duration::from_secs(600)))?;
-
-    // Add TCP keepalive
-    // TCP keepalive is not directly supported in std::net::TcpStream
-    // We'll skip this for now as it's not critical for basic functionality
-    stream.set_read_timeout(Some(Duration::from_secs(300)))?; // Increased timeout
-    stream.set_write_timeout(Some(Duration::from_secs(300)))?;
 
     let mut size_bytes = [0u8; 8];
     stream.read_exact(&mut size_bytes)?;
@@ -185,11 +186,13 @@ fn receive_and_save_file(stream: &mut TcpStream, filename: &str) -> Result<(), S
 
 fn transfer_file(stream: &mut TcpStream, file: &mut File, file_size: u64) -> Result<(), SlkrdError> {
     stream.set_nodelay(true)?;
-    // Set single timeout of 10 minutes
     stream.set_read_timeout(Some(Duration::from_secs(600)))?;
     stream.set_write_timeout(Some(Duration::from_secs(600)))?;
 
-    // Remove duplicate timeout settings and unsupported keepalive
+    // Set TCP keepalive
+    let socket = Socket::from(stream.try_clone()?);
+    socket.set_keepalive(true)?;
+    socket.set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(TCP_KEEPALIVE_DURATION))?;
 
     stream.write_all(&file_size.to_le_bytes())?;
 
@@ -232,9 +235,6 @@ fn transfer_file(stream: &mut TcpStream, file: &mut File, file_size: u64) -> Res
     Ok(())
 }
 
-// Add new constant at the top with other constants
-const MAX_RETRIES: u32 = 3;
-
 fn broadcast_and_transfer(
     discovery_socket: &UdpSocket,
     listener: &TcpListener,
@@ -273,7 +273,6 @@ fn broadcast_and_transfer(
             }
         }
 
-        // Existing code to accept TCP connection and transfer file...
         match listener.accept() {
             Ok((mut stream, _)) => {
                 println!("Receiver connected. Starting transfer...");

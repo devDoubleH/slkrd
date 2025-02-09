@@ -396,6 +396,7 @@ version = "0.1.0"
 dependencies = [
  "get_if_addrs",
  "rand",
+ "socket2",
  "ssh2",
  "tokio",
 ]

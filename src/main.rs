@@ -7,7 +7,7 @@ use std::process;
 use std::time::Duration;
 use rand::Rng;
 
-const BUFFER_SIZE: usize = 1024 * 1024; // Reduced to 1MB
+const BUFFER_SIZE: usize = 64 * 1024; // Reduced to 64KB
 const DISCOVERY_PORT: u16 = 45678;
 const TRANSFER_PORT: u16 = 45679;
 const PASSCODE_LENGTH: usize = 6;
@@ -80,7 +80,7 @@ fn print_usage() {
 }
 
 fn generate_passcode() -> String {
-    const CHARSET: &[u8] = b"0123456789";
+    const CHARSET: &[u8] = b"1234567890";
     let mut rng = rand::thread_rng();
     (0..PASSCODE_LENGTH)
         .map(|_| {
@@ -123,34 +123,32 @@ fn send_file(file_path: &str) -> Result<(), SlkrdError> {
     broadcast_and_transfer(&discovery_socket, &listener, &passcode, &filename, &mut file, file_size)
 }
 
-// Update buffer size to 1MB for better performance with large files
-
-
 fn receive_and_save_file(stream: &mut TcpStream, filename: &str) -> Result<(), SlkrdError> {
     if Path::new(filename).exists() {
         return Err(SlkrdError::FileExists);
     }
 
-    // Set single timeout of 10 minutes
+    // Increase timeout to 10 minutes
     stream.set_read_timeout(Some(Duration::from_secs(600)))?;
     stream.set_write_timeout(Some(Duration::from_secs(600)))?;
+
+    // Add TCP keepalive
+    // TCP keepalive is not directly supported in std::net::TcpStream
+    // We'll skip this for now as it's not critical for basic functionality
+    stream.set_read_timeout(Some(Duration::from_secs(300)))?; // Increased timeout
+    stream.set_write_timeout(Some(Duration::from_secs(300)))?;
 
     let mut size_bytes = [0u8; 8];
     stream.read_exact(&mut size_bytes)?;
     let file_size = u64::from_le_bytes(size_bytes);
 
-    // Use BufWriter for buffered writes
-    let file = File::create(filename)?;
-    let mut file = io::BufWriter::new(file);
+    let mut file = File::create(filename)?;
     let mut buffer = vec![0; BUFFER_SIZE];
     let mut received = 0;
     let start_time = std::time::Instant::now();
     let mut last_update = start_time;
 
     println!("Receiving file: {} ({})", filename, format_size(file_size));
-
-    // Use BufReader for buffered reads
-    let mut stream = io::BufReader::new(stream);
 
     while received < file_size {
         let n = stream.read(&mut buffer)?;
@@ -159,12 +157,11 @@ fn receive_and_save_file(stream: &mut TcpStream, filename: &str) -> Result<(), S
         received += n as u64;
 
         let now = std::time::Instant::now();
-        // Update progress less frequently (every 500ms instead of 100ms)
-        if now.duration_since(last_update).as_millis() >= 500 {
+        if now.duration_since(last_update).as_millis() >= 100 {
             let elapsed = now.duration_since(start_time).as_secs_f64();
             let speed = received as f64 / elapsed;
             let remaining = (file_size - received) as f64 / speed;
-            
+
             print!("\rProgress: {:.1}% ({} / {}) - {}/s - ETA: {:.0}s",
                 (received as f64 / file_size as f64) * 100.0,
                 format_size(received),
@@ -177,9 +174,6 @@ fn receive_and_save_file(stream: &mut TcpStream, filename: &str) -> Result<(), S
         }
     }
 
-    // Ensure all buffered data is written
-    file.flush()?;
-
     if received != file_size {
         return Err(SlkrdError::IncompleteTransfer(received, file_size));
     }
@@ -190,32 +184,33 @@ fn receive_and_save_file(stream: &mut TcpStream, filename: &str) -> Result<(), S
 
 fn transfer_file(stream: &mut TcpStream, file: &mut File, file_size: u64) -> Result<(), SlkrdError> {
     stream.set_nodelay(true)?;
+    // Set single timeout of 10 minutes
     stream.set_read_timeout(Some(Duration::from_secs(600)))?;
     stream.set_write_timeout(Some(Duration::from_secs(600)))?;
 
-    // Use buffered I/O for better performance
-    let mut file = io::BufReader::new(file);
-    let mut stream = io::BufWriter::new(stream);
+    // Remove duplicate timeout settings and unsupported keepalive
+
+    stream.write_all(&file_size.to_le_bytes())?;
+
     let mut buffer = vec![0; BUFFER_SIZE];
     let mut transferred = 0;
     let start_time = std::time::Instant::now();
     let mut last_update = start_time;
-    
+
     println!("Starting transfer of {}", format_size(file_size));
-    
+
     while transferred < file_size {
         let n = file.read(&mut buffer)?;
         if n == 0 { break; }
         stream.write_all(&buffer[..n])?;
         transferred += n as u64;
-        
+
         let now = std::time::Instant::now();
-        // Update progress less frequently
-        if now.duration_since(last_update).as_millis() >= 500 {
+        if now.duration_since(last_update).as_millis() >= 100 {
             let elapsed = now.duration_since(start_time).as_secs_f64();
             let speed = transferred as f64 / elapsed;
             let remaining = (file_size - transferred) as f64 / speed;
-            
+
             print!("\rProgress: {:.1}% ({} / {}) - {}/s - ETA: {:.0}s",
                 (transferred as f64 / file_size as f64) * 100.0,
                 format_size(transferred),
@@ -227,9 +222,6 @@ fn transfer_file(stream: &mut TcpStream, file: &mut File, file_size: u64) -> Res
             last_update = now;
         }
     }
-
-    // Ensure all buffered data is written
-    stream.flush()?;
 
     if transferred != file_size {
         return Err(SlkrdError::IncompleteTransfer(transferred, file_size));
@@ -252,7 +244,7 @@ fn broadcast_and_transfer(
     file_size: u64
 ) -> Result<(), SlkrdError> {
     let mut retries = 0;
-    
+
     while retries < MAX_RETRIES {
         let message = format!("SLKRD:{}:{}", passcode, filename);
         discovery_socket.send_to(message.as_bytes(), ("255.255.255.255", DISCOVERY_PORT))?;
@@ -279,7 +271,7 @@ fn broadcast_and_transfer(
             Err(_) => return Err(SlkrdError::ConnectionFailed),
         }
     }
-    
+
     Err(SlkrdError::Timeout)
 }
 
@@ -303,7 +295,7 @@ fn receive_file(passcode: &str) -> Result<(), SlkrdError> {
     println!("Searching for sender...");
 
     let (sender_addr, filename) = find_sender(&socket, passcode)?;
-    
+
     let mut stream = TcpStream::connect((sender_addr.ip(), TRANSFER_PORT))?;
     receive_and_save_file(&mut stream, &filename)
 }

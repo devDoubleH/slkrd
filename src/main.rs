@@ -2,6 +2,7 @@ use std::env;
 use std::fs::File;
 use std::io::{self, Read, Write, Seek, ErrorKind};
 use std::net::{TcpListener, TcpStream, UdpSocket, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddrV4};  // Add this import
 use std::path::Path;
 use std::process;
 use std::time::Duration;
@@ -234,21 +235,45 @@ fn transfer_file(stream: &mut TcpStream, file: &mut File, file_size: u64) -> Res
 // Add new constant at the top with other constants
 const MAX_RETRIES: u32 = 3;
 
-// In broadcast_and_transfer function
 fn broadcast_and_transfer(
     discovery_socket: &UdpSocket,
     listener: &TcpListener,
     passcode: &str,
     filename: &str,
     file: &mut File,
-    file_size: u64
+    file_size: u64,
 ) -> Result<(), SlkrdError> {
+    let message = format!("SLKRD:{}:{}", passcode, filename);
     let mut retries = 0;
 
     while retries < MAX_RETRIES {
-        let message = format!("SLKRD:{}:{}", passcode, filename);
-        discovery_socket.send_to(message.as_bytes(), ("255.255.255.255", DISCOVERY_PORT))?;
+        // Get all network interfaces and their broadcast addresses
+        let interfaces = match get_if_addrs::get_if_addrs() {
+            Ok(interfaces) => interfaces,
+            Err(e) => {
+                eprintln!("Failed to get network interfaces: {}", e);
+                // Fallback to global broadcast
+                let _ = discovery_socket.send_to(message.as_bytes(), ("255.255.255.255", DISCOVERY_PORT));
+                vec![]
+            }
+        };
 
+        // Send broadcast to each valid interface
+        for interface in interfaces {
+            if interface.is_loopback() {
+                continue;
+            }
+            if let get_if_addrs::IfAddr::V4(addr) = interface.addr {
+                if let Some(broadcast) = addr.broadcast {
+                    let target = SocketAddrV4::new(broadcast, DISCOVERY_PORT);
+                    if let Err(e) = discovery_socket.send_to(message.as_bytes(), target) {
+                        eprintln!("Failed to send to {}: {}", broadcast, e);
+                    }
+                }
+            }
+        }
+
+        // Existing code to accept TCP connection and transfer file...
         match listener.accept() {
             Ok((mut stream, _)) => {
                 println!("Receiver connected. Starting transfer...");
@@ -257,18 +282,18 @@ fn broadcast_and_transfer(
                     Err(SlkrdError::Timeout) => {
                         eprintln!("Transfer timed out, retrying... ({}/{})", retries + 1, MAX_RETRIES);
                         retries += 1;
-                        // Seek back to start of file for retry
                         file.seek(std::io::SeekFrom::Start(0))?;
-                        continue;
                     }
                     Err(e) => return Err(e),
                 }
             }
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(100));
-                continue;
             }
-            Err(_) => return Err(SlkrdError::ConnectionFailed),
+            Err(e) => {
+                eprintln!("Connection error: {}", e);
+                return Err(SlkrdError::ConnectionFailed);
+            }
         }
     }
 

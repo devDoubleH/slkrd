@@ -9,7 +9,7 @@ use std::time::Duration;
 
 const BUFFER_SIZE: usize = 8192;
 const PORT: u16 = 8080;
-const PASSCODE_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+const PASSCODE_CHARS: &[u8] = b"0123456789";
 
 #[derive(Debug)]
 enum SlkrdError {

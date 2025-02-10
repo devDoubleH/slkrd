@@ -76,8 +76,8 @@ fn main() -> Result<(), FileTransferError> {
 
 fn print_usage() {
     println!("Usage:");
-    println!("  Send file:    tcp-transfer -s <file_path>");
-    println!("  Receive file: tcp-transfer -r <passcode>");
+    println!("  Send file:    slkrd -s <file_path>");
+    println!("  Receive file: slkrd -r <passcode>");
     process::exit(1);
 }
 

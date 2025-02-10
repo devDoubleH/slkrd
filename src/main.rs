@@ -1,199 +1,154 @@
-use clap::Parser;
+use clap::{Arg, Command};
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::Rng;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
-use std::thread;
 use std::time::Duration;
 
 const BUFFER_SIZE: usize = 8192;
-const PORT: u16 = 3000;
-const MAX_RETRIES: u32 = 30; // 30 seconds max wait time
+const PORT: u16 = 8080;
+const PASSCODE_CHARS: &[u8] = b"0123456789";
 
-#[derive(Parser)]
-#[command(author, version, about)]
-struct Cli {
-    /// Send file
-    #[arg(short = 's')]
-    send: Option<String>,
-
-    /// Receive file with passcode
-    #[arg(short = 'r')]
-    receive: Option<String>,
+#[derive(Debug)]
+enum SlkrdError {
+    IoError(std::io::Error),
+    NetworkError(String),
+    InvalidPasscode,
 }
 
-fn main() -> std::io::Result<()> {
-    let cli = Cli::parse();
-
-    if let Some(file_path) = cli.send {
-        let passcode = generate_passcode();
-        println!("Your passcode is: {}", passcode);
-        println!("Waiting for receiver to connect...");
-        send_file(&file_path, &passcode)
-    } else if let Some(passcode) = cli.receive {
-        println!("Attempting to connect to sender...");
-        match receive_file(&passcode) {
-            Ok(_) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                println!("Could not connect to sender. Make sure:");
-                println!("1. The sender has started the program first");
-                println!("2. Both sender and receiver are on the same network");
-                println!("3. The passcode is correct");
-                println!("4. No firewall is blocking port {}", PORT);
-                Err(e)
-            }
-            Err(e) => Err(e),
-        }
-    } else {
-        println!("Please use -s to send or -r to receive");
-        Ok(())
+impl From<std::io::Error> for SlkrdError {
+    fn from(error: std::io::Error) -> Self {
+        SlkrdError::IoError(error)
     }
 }
 
 fn generate_passcode() -> String {
     let mut rng = rand::thread_rng();
-    format!("{:06}", rng.gen_range(0..999999))
+    (0..6)
+        .map(|_| {
+            let idx = rng.gen_range(0..PASSCODE_CHARS.len());
+            PASSCODE_CHARS[idx] as char
+        })
+        .collect()
 }
 
-fn send_file(file_path: &str, passcode: &str) -> std::io::Result<()> {
-    let path = Path::new(file_path);
-    if !path.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "File not found",
-        ));
-    }
-
+fn send_file(filepath: &str) -> Result<(), SlkrdError> {
+    let path = Path::new(filepath);
+    let file = File::open(path)?;
+    let file_size = file.metadata()?.len();
+    let passcode = generate_passcode();
+    
+    println!("Starting file server with passcode: {}", passcode);
+    
     let listener = TcpListener::bind(format!("0.0.0.0:{}", PORT))?;
-    println!("Listening on port {}...", PORT);
-    println!("Make sure the receiver uses the passcode: {}", passcode);
-
+    
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
-                println!("Connection received, verifying passcode...");
+                let mut received_passcode = String::new();
+                stream.read_to_string(&mut received_passcode)?;
                 
-                // First, receive the passcode from client
-                let mut received_passcode = [0; 6];
-                stream.read_exact(&mut received_passcode)?;
-                
-                if passcode != String::from_utf8_lossy(&received_passcode) {
-                    println!("Wrong passcode received, waiting for correct passcode...");
-                    continue;
+                if received_passcode.trim() != passcode {
+                    return Err(SlkrdError::InvalidPasscode);
                 }
-
-                println!("Passcode verified, starting file transfer...");
-                let mut file = File::open(path)?;
-                let file_size = file.metadata()?.len();
                 
-                // Send file size
+                // Send file size first
                 stream.write_all(&file_size.to_le_bytes())?;
                 
-                // Send filename
-                let filename = path.file_name().unwrap().to_str().unwrap();
-                let filename_bytes = filename.as_bytes();
-                let filename_len = filename_bytes.len() as u8;
-                stream.write_all(&[filename_len])?;
-                stream.write_all(filename_bytes)?;
-
+                // Create progress bar
                 let pb = ProgressBar::new(file_size);
                 pb.set_style(ProgressStyle::default_bar()
-                    .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+                    .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
                     .unwrap()
                     .progress_chars("#>-"));
-
+                
+                // Send file data
+                let mut file = File::open(path)?;
                 let mut buffer = [0; BUFFER_SIZE];
                 let mut sent = 0;
+                
                 while sent < file_size {
                     let n = file.read(&mut buffer)?;
-                    if n == 0 {
-                        break;
-                    }
+                    if n == 0 { break; }
                     stream.write_all(&buffer[..n])?;
                     sent += n as u64;
                     pb.set_position(sent);
                 }
-
-                pb.finish_with_message("File sent successfully!");
+                
+                pb.finish_with_message("Transfer complete");
                 return Ok(());
             }
-            Err(e) => {
-                println!("Connection error: {}", e);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn receive_file(passcode: &str) -> std::io::Result<()> {
-    let mut retry_count = 0;
-    let mut last_error = None;
-
-    while retry_count < MAX_RETRIES {
-        match TcpStream::connect(format!("127.0.0.1:{}", PORT)) {
-            Ok(mut stream) => {
-                stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-                println!("Connected to sender, verifying passcode...");
-                
-                // Send passcode
-                stream.write_all(passcode.as_bytes())?;
-                
-                // Receive file size
-                let mut size_bytes = [0u8; 8];
-                match stream.read_exact(&mut size_bytes) {
-                    Ok(_) => {
-                        let file_size = u64::from_le_bytes(size_bytes);
-                        
-                        // Receive filename
-                        let mut filename_len = [0u8; 1];
-                        stream.read_exact(&mut filename_len)?;
-                        let mut filename_bytes = vec![0u8; filename_len[0] as usize];
-                        stream.read_exact(&mut filename_bytes)?;
-                        let filename = String::from_utf8_lossy(&filename_bytes);
-
-                        println!("Starting to receive file: {}", filename);
-                        
-                        let pb = ProgressBar::new(file_size);
-                        pb.set_style(ProgressStyle::default_bar()
-                            .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
-                            .unwrap()
-                            .progress_chars("#>-"));
-
-                        let mut file = File::create(&*filename)?;
-                        let mut buffer = [0; BUFFER_SIZE];
-                        let mut received = 0;
-                        
-                        while received < file_size {
-                            let n = stream.read(&mut buffer)?;
-                            if n == 0 {
-                                break;
-                            }
-                            file.write_all(&buffer[..n])?;
-                            received += n as u64;
-                            pb.set_position(received);
-                        }
-
-                        pb.finish_with_message("File received successfully!");
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        println!("Wrong passcode or connection interrupted. Please verify the passcode and try again.");
-                        return Err(e);
-                    }
-                }
-            }
-            Err(e) => {
-                last_error = Some(e);
-                retry_count += 1;
-                thread::sleep(Duration::from_secs(1));
-                print!("\rAttempting to connect... {}/{}", retry_count, MAX_RETRIES);
-                std::io::stdout().flush()?;
-            }
+            Err(e) => return Err(SlkrdError::NetworkError(e.to_string())),
         }
     }
     
-    println!("\nCould not connect after {} attempts.", MAX_RETRIES);
-    Err(last_error.unwrap())
+    Ok(())
+}
+
+fn receive_file(passcode: &str) -> Result<(), SlkrdError> {
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PORT))?;
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    
+    // Send passcode
+    stream.write_all(passcode.as_bytes())?;
+    
+    // Read file size
+    let mut size_bytes = [0u8; 8];
+    stream.read_exact(&mut size_bytes)?;
+    let file_size = u64::from_le_bytes(size_bytes);
+    
+    // Create progress bar
+    let pb = ProgressBar::new(file_size);
+    pb.set_style(ProgressStyle::default_bar()
+        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+        .unwrap()
+        .progress_chars("#>-"));
+    
+    // Receive and write file
+    let mut file = File::create("received_file")?;
+    let mut buffer = [0; BUFFER_SIZE];
+    let mut received = 0;
+    
+    while received < file_size {
+        let n = stream.read(&mut buffer)?;
+        if n == 0 { break; }
+        file.write_all(&buffer[..n])?;
+        received += n as u64;
+        pb.set_position(received);
+    }
+    
+    pb.finish_with_message("Transfer complete");
+    Ok(())
+}
+
+fn main() {
+    let matches = Command::new("slkrd")
+        .version("1.0")
+        .author("Your Name")
+        .about("Fast peer-to-peer file sharing tool")
+        .arg(Arg::new("send")
+            .short('s')
+            .value_name("FILE")
+            .help("Send a file"))
+        .arg(Arg::new("receive")
+            .short('r')
+            .value_name("PASSCODE")
+            .help("Receive a file with passcode"))
+        .get_matches();
+
+    if let Some(file) = matches.get_one::<String>("send") {
+        match send_file(file) {
+            Ok(_) => println!("File sent successfully"),
+            Err(e) => eprintln!("Error sending file: {:?}", e),
+        }
+    } else if let Some(passcode) = matches.get_one::<String>("receive") {
+        match receive_file(passcode) {
+            Ok(_) => println!("File received successfully"),
+            Err(e) => eprintln!("Error receiving file: {:?}", e),
+        }
+    } else {
+        println!("Please use -s to send a file or -r to receive a file");
+    }
 }
